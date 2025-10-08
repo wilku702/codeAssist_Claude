@@ -57,7 +57,7 @@ def DeleteAllFiles () :
 #--------- Main ---------#
 if __name__ == "__main__":
     # Upload student code
-    assignment_path = Path("assignment-examples/A3")
+    assignment_path = Path("assignment-examples/A4")
     file_ids = UploadFiles(assignment_path, "*.py")
     print(file_ids)
 
