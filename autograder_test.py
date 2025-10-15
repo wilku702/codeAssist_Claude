@@ -50,12 +50,15 @@ def _collect_artifacts(root: Path, result: dict):
         try: result["junit_xml"] = xml[0].read_text(errors="ignore")[-20000:]
         except Exception as e: result["junit_xml_error"] = str(e)
 
-def _copy_student(src_dir: Path, dst_root: Path):
+def _copy_student(src_dir: Path, dst_root: Path) -> list[Path]:
+    copied: list[Path] = []
     for p in src_dir.rglob("*"):
         if p.is_file():
             dest = dst_root / p.relative_to(src_dir)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dest)
+            copied.append(dest)
+    return copied
 
 def _discover_tests(root: Path):
     """
@@ -77,20 +80,42 @@ def _discover_tests(root: Path):
     files = sorted(files, key=lambda p: len(p.parts))
     return None, files
 
+def _uses_autograder_mount(script: Optional[Path]) -> bool:
+    if not script or not script.exists():
+        return False
+    try:
+        text = script.read_text(errors="ignore")
+    except Exception:
+        return False
+    return "/autograder/" in text
+
 def run_autograder_zip(zip_path: str,
                        student_dir: Optional[str] = None,
                        timeout: int = 180) -> dict:
     work = Path(tempfile.mkdtemp(prefix="grader_"))
     result = {"returncode": None, "stdout": "", "stderr": ""}
 
+    zip_path = str(Path(zip_path).resolve())
+    student_dir = str(Path(student_dir).resolve()) if student_dir else None
+
     try:
         # 1) Unzip
-        _run(["unzip", "-q", zip_path, "-d", str(work)], cwd=work, timeout=timeout, env=os.environ.copy())
+        unzip_proc = _run(["unzip", "-q", zip_path, "-d", str(work)], cwd=work, timeout=timeout, env=os.environ.copy())
+        result["unzip_returncode"] = unzip_proc.returncode
+        if unzip_proc.returncode != 0:
+            result.update({
+                "returncode": 7,
+                "stdout": unzip_proc.stdout[-2000:],
+                "stderr": unzip_proc.stderr[-2000:],
+                "note": "Failed to unzip autograder bundle."
+            })
+            return result
         root = _find_singleton_root(work)
 
         # 2) Copy student code (optional)
+        student_copies: list[Path] = []
         if student_dir:
-            _copy_student(Path(student_dir), root)
+            student_copies = _copy_student(Path(student_dir), root)
 
         # 3) Install deps
         _install_requirements(root, timeout, result)
@@ -104,14 +129,22 @@ def run_autograder_zip(zip_path: str,
         env = os.environ.copy()
         env["PYTHONPATH"] = str(root) + (os.pathsep + env.get("PYTHONPATH", ""))
 
-        if run_autograder:
+        if student_copies:
+            # Prefer top-level Python files that originated from the student submission.
+            student_py = [p for p in student_copies if p.suffix == ".py"]
+            if student_py:
+                # Choose the shallowest path to mimic run_autograder behavior.
+                student_py.sort(key=lambda p: len(p.parts))
+                env.setdefault("FILENAME", str(student_py[0]))
+
+        if run_autograder and not _uses_autograder_mount(run_autograder):
             _make_exec(run_autograder)
             proc = _run([str(run_autograder)], cwd=run_autograder.parent, timeout=timeout, env=env)
             result.update({"returncode": proc.returncode, "stdout": proc.stdout[-8000:], "stderr": proc.stderr[-8000:]})
             _collect_artifacts(root, result)
             return result
 
-        if setup_sh and run_tests_py:
+        if setup_sh and run_tests_py and not _uses_autograder_mount(run_tests_py):
             _make_exec(setup_sh)
             s1 = _run(["bash", str(setup_sh)], cwd=setup_sh.parent, timeout=timeout, env=env)
             if s1.returncode != 0:
@@ -126,8 +159,13 @@ def run_autograder_zip(zip_path: str,
         # 5) Fallback: discover tests anywhere; run them explicitly
         tests_dir, test_files = _discover_tests(root)
         if tests_dir:
-            pytest_cwd = tests_dir
-            cmd = ["pytest", "-q", "--disable-warnings", "--junitxml", "report.xml"]
+            pytest_cwd = root
+            try:
+                rel_tests = tests_dir.relative_to(root)
+                target = str(rel_tests)
+            except ValueError:
+                target = str(tests_dir)
+            cmd = ["pytest", "-q", "--disable-warnings", "--junitxml", "report.xml", target]
         elif test_files:
             pytest_cwd = root
             # Pass explicit file list so pytest definitely runs something
@@ -139,6 +177,11 @@ def run_autograder_zip(zip_path: str,
                 "stderr": "No tests directory or test files found (patterns: tests/, test_*.py, *_test.py)."
             })
             return result
+
+        try:
+            result["workspace_listing"] = sorted(str(p.relative_to(root)) for p in root.iterdir())
+        except Exception:
+            result["workspace_listing_error"] = "Failed to list workspace"
 
         proc = _run(cmd, cwd=pytest_cwd, timeout=timeout, env=env)
         result.update({"returncode": proc.returncode, "stdout": proc.stdout[-8000:], "stderr": proc.stderr[-8000:]})
